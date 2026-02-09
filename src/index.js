@@ -12,141 +12,187 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  WebhookClient,
+  InteractionType,
 } = require("discord.js");
 
 const { rewriteText } = require("./rewriteClient");
 
-console.log("Starting NeuroBridge…");
+// ---- helpers to sanitize env vars coming from Render UI ----
+function cleanEnv(v) {
+  if (v == null) return "";
+  let s = String(v);
 
-const drafts = new Map();
+  // remove common accidental wrapping quotes
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
+  }
+
+  // trim whitespace + newlines
+  s = s.trim();
+
+  return s;
+}
+
+const DISCORD_TOKEN = cleanEnv(process.env.DISCORD_TOKEN);
+const DISCORD_CLIENT_ID = cleanEnv(process.env.DISCORD_CLIENT_ID);
+
+// Hard fail early with clear reasons (Render logs)
+if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN (Render Environment)");
+if (!DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID (Render Environment)");
+
+// If token still contains whitespace inside, it’s definitely pasted wrong
+if (/\s/.test(DISCORD_TOKEN)) {
+  throw new Error("DISCORD_TOKEN contains whitespace/newlines. Re-paste token in Render (no spaces/quotes).");
+}
+
+console.log(`Starting NeuroBridge… (token length=${DISCORD_TOKEN.length}, clientId=${DISCORD_CLIENT_ID})`);
+
+const pendingByUser = new Map();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("compose")
+    .setDescription("Privately write → AI rewrites → send only the rewritten message."),
+].map((c) => c.toJSON());
+
 async function registerCommands() {
-  if (!process.env.DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID");
-  if (!process.env.DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
-
-  const commands = [
-    new SlashCommandBuilder()
-      .setName("compose")
-      .setDescription("Privately write, rewrite, and send only the rewritten message.")
-      .toJSON(),
-  ];
-
-  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands });
-  console.log("✅ Slash commands registered.");
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+  await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: commands });
 }
 
-async function getOrCreateWebhook(channel) {
-  const webhooks = await channel.fetchWebhooks();
-  let hook = webhooks.find((w) => w.owner && w.owner.id === client.user.id);
-  if (!hook) hook = await channel.createWebhook({ name: "NeuroBridge" });
-  return hook;
-}
+async function sendViaWebhook(interaction, content) {
+  const channel = interaction.channel;
+  if (!channel) throw new Error("No channel found for webhook send");
 
-client.once("ready", () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-});
+  const hooks = await channel.fetchWebhooks();
+  let hook = hooks.find((h) => h.owner && h.owner.id === client.user.id);
+
+  if (!hook) {
+    hook = await channel.createWebhook({
+      name: "NeuroBridge",
+      reason: "NeuroBridge rewrite sending",
+    });
+  }
+
+  await hook.send({
+    content,
+    username: interaction.user.username,
+    avatarURL: interaction.user.displayAvatarURL(),
+  });
+}
 
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isChatInputCommand() && interaction.commandName === "compose") {
       const modal = new ModalBuilder()
-        .setCustomId("composeModal")
+        .setCustomId("nb_compose_modal")
         .setTitle("NeuroBridge — Compose");
 
       const input = new TextInputBuilder()
-        .setCustomId("composeText")
+        .setCustomId("nb_original_text")
         .setLabel("Type what you want to say (private)")
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(1800);
 
       modal.addComponents(new ActionRowBuilder().addComponents(input));
-      return interaction.showModal(modal);
+
+      await interaction.showModal(modal);
+      return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === "composeModal") {
+    if (interaction.type === InteractionType.ModalSubmit && interaction.customId === "nb_compose_modal") {
       await interaction.deferReply({ ephemeral: true });
 
-      const originalText = interaction.fields.getTextInputValue("composeText");
-      const result = await rewriteText({ originalText });
+      const originalText = interaction.fields.getTextInputValue("nb_original_text");
+      const { rewritten_text } = await rewriteText({ originalText });
 
-      drafts.set(interaction.user.id, {
-        rewritten: result.rewritten_text,
+      pendingByUser.set(interaction.user.id, {
+        rewrittenText: rewritten_text,
         channelId: interaction.channelId,
+        createdAt: Date.now(),
       });
 
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("sendRewrite")
-          .setLabel("Send rewrite")
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId("cancelRewrite")
-          .setLabel("Cancel")
-          .setStyle(ButtonStyle.Danger)
-      );
+      const sendBtn = new ButtonBuilder()
+        .setCustomId("nb_send_rewrite")
+        .setLabel("Send rewrite")
+        .setStyle(ButtonStyle.Success);
 
-      return interaction.editReply({
-        content: result.rewritten_text,
+      const cancelBtn = new ButtonBuilder()
+        .setCustomId("nb_cancel_rewrite")
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary);
+
+      const row = new ActionRowBuilder().addComponents(sendBtn, cancelBtn);
+
+      await interaction.editReply({
+        content: `**Rewrite preview (only you can see this):**\n\n${rewritten_text}`,
         components: [row],
       });
+
+      return;
     }
 
     if (interaction.isButton()) {
       await interaction.deferReply({ ephemeral: true });
 
-      const draft = drafts.get(interaction.user.id);
-      if (!draft) return interaction.editReply("No active draft found. Run /compose again.");
-
-      if (interaction.customId === "cancelRewrite") {
-        drafts.delete(interaction.user.id);
-        return interaction.editReply("Canceled.");
+      if (interaction.customId === "nb_cancel_rewrite") {
+        pendingByUser.delete(interaction.user.id);
+        await interaction.editReply({ content: "Cancelled.", components: [] });
+        return;
       }
 
-      if (interaction.customId === "sendRewrite") {
-        const channel = await client.channels.fetch(draft.channelId);
+      if (interaction.customId === "nb_send_rewrite") {
+        const pending = pendingByUser.get(interaction.user.id);
+        if (!pending) {
+          await interaction.editReply({ content: "No pending rewrite found. Run /compose again.", components: [] });
+          return;
+        }
 
-        const hook = await getOrCreateWebhook(channel);
-        const webhookClient = new WebhookClient({ url: hook.url });
+        if (pending.channelId !== interaction.channelId) {
+          await interaction.editReply({
+            content: "That rewrite was created in a different channel. Run /compose again here.",
+            components: [],
+          });
+          return;
+        }
 
-        await webhookClient.send({
-          content: draft.rewritten,
-          username: interaction.member?.displayName || interaction.user.username,
-          avatarURL: interaction.user.displayAvatarURL(),
-        });
+        try {
+          await sendViaWebhook(interaction, pending.rewrittenText);
+        } catch {
+          await interaction.channel.send(pending.rewrittenText);
+        }
 
-        drafts.delete(interaction.user.id);
-        return interaction.editReply("Sent. Only the rewrite was posted.");
+        pendingByUser.delete(interaction.user.id);
+        await interaction.editReply({ content: "Sent.", components: [] });
+        return;
       }
     }
-  } catch (e) {
-    const msg = e?.message ? e.message : String(e);
-    if (interaction.isRepliable()) {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply(`Error: ${msg}`);
-      } else {
-        await interaction.reply({ content: `Error: ${msg}`, ephemeral: true });
+  } catch (err) {
+    console.error("Interaction error:", err);
+    try {
+      if (interaction.deferred) {
+        await interaction.editReply({ content: `Error: ${err.message || String(err)}`, components: [] });
+      } else if (!interaction.replied) {
+        await interaction.reply({ content: `Error: ${err.message || String(err)}`, ephemeral: true });
       }
-    }
-    console.error(e);
+    } catch {}
   }
 });
 
-(async () => {
-  try {
-    if (!process.env.DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN in .env");
-    if (!process.env.DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID in .env");
+client.once("ready", () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+});
 
-    await client.login(process.env.DISCORD_TOKEN);
-    await registerCommands();
-  } catch (e) {
-    console.error("Startup error:", e);
-    process.exit(1);
-  }
+(async () => {
+  await registerCommands();
+  console.log("✅ Slash commands registered.");
+  await client.login(DISCORD_TOKEN);
 })();
