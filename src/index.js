@@ -17,36 +17,39 @@ const {
 
 const { rewriteText } = require("./rewriteClient");
 
-// ---- helpers to sanitize env vars coming from Render UI ----
+// ---- helpers to sanitize env vars (Render UI can add quotes/whitespace) ----
 function cleanEnv(v) {
   if (v == null) return "";
   let s = String(v);
 
-  // remove common accidental wrapping quotes
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
     s = s.slice(1, -1);
   }
 
-  // trim whitespace + newlines
-  s = s.trim();
-
-  return s;
+  return s.trim();
 }
 
 const DISCORD_TOKEN = cleanEnv(process.env.DISCORD_TOKEN);
 const DISCORD_CLIENT_ID = cleanEnv(process.env.DISCORD_CLIENT_ID);
+const DISCORD_GUILD_ID = cleanEnv(process.env.DISCORD_GUILD_ID); // optional but recommended for instant command updates
 
-// Hard fail early with clear reasons (Render logs)
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN (Render Environment)");
 if (!DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID (Render Environment)");
 
-// If token still contains whitespace inside, it’s definitely pasted wrong
 if (/\s/.test(DISCORD_TOKEN)) {
-  throw new Error("DISCORD_TOKEN contains whitespace/newlines. Re-paste token in Render (no spaces/quotes).");
+  throw new Error(
+    "DISCORD_TOKEN contains whitespace/newlines. Re-paste token in Render (no spaces/quotes)."
+  );
 }
 
-console.log(`Starting NeuroBridge… (token length=${DISCORD_TOKEN.length}, clientId=${DISCORD_CLIENT_ID})`);
+console.log(
+  `Starting NeuroBridge… (token length=${DISCORD_TOKEN.length}, clientId=${DISCORD_CLIENT_ID}, guildId=${DISCORD_GUILD_ID || "GLOBAL"})`
+);
 
+// In-memory store for pending rewrites per user (good enough for MVP)
 const pendingByUser = new Map();
 
 const client = new Client({
@@ -56,6 +59,7 @@ const client = new Client({
 process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
 process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 
+// ---- Slash Commands ----
 const commands = [
   new SlashCommandBuilder()
     .setName("compose")
@@ -64,9 +68,22 @@ const commands = [
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
-  await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: commands });
+
+  if (DISCORD_GUILD_ID) {
+    // Guild commands update almost instantly (best for testing / demos)
+    await rest.put(
+      Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID),
+      { body: commands }
+    );
+    console.log(`✅ Slash commands registered (GUILD ${DISCORD_GUILD_ID}).`);
+  } else {
+    // Global commands can take time to propagate
+    await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: commands });
+    console.log("✅ Slash commands registered (GLOBAL).");
+  }
 }
 
+// ---- Webhook send (so only rewrite is posted and appears as the user) ----
 async function sendViaWebhook(interaction, content) {
   const channel = interaction.channel;
   if (!channel) throw new Error("No channel found for webhook send");
@@ -88,8 +105,10 @@ async function sendViaWebhook(interaction, content) {
   });
 }
 
+// ---- Main interaction handler ----
 client.on("interactionCreate", async (interaction) => {
   try {
+    // /compose -> show modal
     if (interaction.isChatInputCommand() && interaction.commandName === "compose") {
       const modal = new ModalBuilder()
         .setCustomId("nb_compose_modal")
@@ -108,7 +127,11 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    if (interaction.type === InteractionType.ModalSubmit && interaction.customId === "nb_compose_modal") {
+    // Modal submit -> acknowledge immediately (prevents “Application did not respond”)
+    if (
+      interaction.type === InteractionType.ModalSubmit &&
+      interaction.customId === "nb_compose_modal"
+    ) {
       await interaction.deferReply({ ephemeral: true });
 
       const originalText = interaction.fields.getTextInputValue("nb_original_text");
@@ -140,6 +163,7 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    // Buttons
     if (interaction.isButton()) {
       await interaction.deferReply({ ephemeral: true });
 
@@ -151,8 +175,12 @@ client.on("interactionCreate", async (interaction) => {
 
       if (interaction.customId === "nb_send_rewrite") {
         const pending = pendingByUser.get(interaction.user.id);
+
         if (!pending) {
-          await interaction.editReply({ content: "No pending rewrite found. Run /compose again.", components: [] });
+          await interaction.editReply({
+            content: "No pending rewrite found. Run /compose again.",
+            components: [],
+          });
           return;
         }
 
@@ -164,9 +192,11 @@ client.on("interactionCreate", async (interaction) => {
           return;
         }
 
+        // Post only rewritten text
         try {
           await sendViaWebhook(interaction, pending.rewrittenText);
-        } catch {
+        } catch (e) {
+          // Fallback if webhooks not allowed
           await interaction.channel.send(pending.rewrittenText);
         }
 
@@ -177,22 +207,32 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (err) {
     console.error("Interaction error:", err);
+
     try {
       if (interaction.deferred) {
-        await interaction.editReply({ content: `Error: ${err.message || String(err)}`, components: [] });
+        await interaction.editReply({
+          content: `Error: ${err.message || String(err)}`,
+          components: [],
+        });
       } else if (!interaction.replied) {
-        await interaction.reply({ content: `Error: ${err.message || String(err)}`, ephemeral: true });
+        await interaction.reply({
+          content: `Error: ${err.message || String(err)}`,
+          ephemeral: true,
+        });
       }
-    } catch {}
+    } catch {
+      // ignore secondary failures
+    }
   }
 });
 
-client.once("ready", () => {
+// Use clientReady to avoid the v15 deprecation warning
+client.once("clientReady", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
+// ---- Start ----
 (async () => {
   await registerCommands();
-  console.log("✅ Slash commands registered.");
   await client.login(DISCORD_TOKEN);
 })();
